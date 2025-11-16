@@ -1,0 +1,266 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import openpyxl
+import os
+
+file = r"C:\Users\cufet\Desktop\最优基金选择结果_2022-2025.xlsx"
+ALWAYS_ALLOWED = ["518880", "270042"]
+
+# ============================================================
+# 读取 Excel（强制读取 Sheet1）
+# ============================================================
+raw = pd.read_excel(file, sheet_name="Sheet1", header=None, dtype=object)
+nrows, ncols = raw.shape
+print("raw shape:", raw.shape)
+
+# ============================================================
+# 识别 meta 行
+# ============================================================
+def find_meta_row_by_firstcol(keywords):
+    for i in range(20):
+        v = raw.iat[i, 0]
+        if pd.isna(v):
+            continue
+        s = str(v).strip().lower()
+        for kw in keywords:
+            if kw.lower() in s:
+                return i
+    return None
+
+row_fundcode = find_meta_row_by_firstcol(["基金代码"])
+row_cluster  = find_meta_row_by_firstcol(["聚类"])
+row_quarter  = find_meta_row_by_firstcol(["季度"])
+row_fundname = find_meta_row_by_firstcol(["基金名称"])
+row_fundtype = find_meta_row_by_firstcol(["基金类型"])
+
+print("Found rows:", row_fundcode, row_cluster, row_quarter, row_fundname)
+if row_fundcode is None:
+    raise ValueError("找不到基金代码行")
+
+# ============================================================
+# 识别日期开始行
+# ============================================================
+date_start = None
+for i in range(row_fundcode + 1, nrows):
+    dt = pd.to_datetime(raw.iat[i, 0], errors='coerce')
+    if not pd.isna(dt):
+        date_start = i
+        break
+if date_start is None:
+    raise ValueError("找不到日期开始行")
+print("date_start:", date_start)
+
+# ============================================================
+# 找基金列
+# ============================================================
+fund_cols = []
+fund_codes = {}
+for c in range(1, ncols):
+    v = raw.iat[row_fundcode, c]
+    if pd.isna(v):
+        continue
+    code = str(v).strip()
+    fund_cols.append(c)
+    fund_codes[c] = code
+
+# 去重基金代码（确保无重复）
+unique_cols = []
+seen = set()
+for c in fund_cols:
+    cd = fund_codes[c]
+    if cd not in seen:
+        seen.add(cd)
+        unique_cols.append(c)
+
+fund_cols = unique_cols
+print("基金数量:", len(fund_cols))
+
+# ============================================================
+# NAV 数据
+# ============================================================
+dates = pd.to_datetime(raw.iloc[date_start:, 0], errors='coerce')
+valid_mask = ~dates.isna()
+dates = dates[valid_mask].reset_index(drop=True)
+
+nav_part = raw.iloc[date_start:, fund_cols].loc[valid_mask].reset_index(drop=True)
+nav_part = nav_part.apply(pd.to_numeric, errors="coerce")
+nav_part.index = dates
+nav_part.columns = [fund_codes[c] for c in fund_cols]
+
+daily_ret = nav_part.pct_change().dropna(how="all")
+
+# ============================================================
+# 元信息
+def get_meta(row, c):
+    if row is None:
+        return None
+    v = raw.iat[row, c]
+    return None if pd.isna(v) else str(v).strip()
+
+def is_bond_fund(fund_code):
+    """根据基金类型判断是否为债券型基金"""
+    fund_type_str = fund_type.get(fund_code, "")
+    if fund_type_str and "债" in fund_type_str:  # 如果类型包含"债"字
+        return True
+    return False
+
+fund_quarter = { fund_codes[c]: get_meta(row_quarter, c) for c in fund_cols }
+fund_cluster = { fund_codes[c]: get_meta(row_cluster, c) for c in fund_cols }
+fund_type = { fund_codes[c]: get_meta(row_fundtype, c) for c in fund_cols }
+# ============================================================
+# 风险平价优化
+# ============================================================
+def risk_parity_weights(cov, allowed_funds=None, always_allowed=None):
+    cov_mat = cov.values
+    n = len(cov)
+    always_indices = []
+    if always_allowed and allowed_funds is not None:
+        for fund in always_allowed:
+            if fund in cov.index:  # 检查基金是否在协方差矩阵中
+                idx = list(cov.index).index(fund)
+                always_indices.append(idx)
+
+    # x0 = np.ones(n) / n
+    # vol = np.sqrt(np.diag(cov_mat))
+    # x0 = (1/vol) / (1/vol).sum()
+    np.random.seed(42)  # 固定随机种子保证可重复性
+    x0 = np.random.dirichlet(np.ones(n))
+    cons = [{'type': 'eq', 'fun': lambda w: w.sum() - 1}]
+    if always_indices:
+        def always_constraint(w):
+            return 0.15 - w[always_indices].sum()  # 权重和 <= 15%
+
+        cons.append({'type': 'ineq', 'fun': always_constraint})
+
+    bnds = tuple((0,1) for _ in range(n))
+
+    def obj(w):
+        port = w @ cov_mat @ w
+        mrc = cov_mat @ w
+        trc = w * mrc / (np.sqrt(port) + 1e-12)
+        target = trc.sum()/n
+        return ((trc-target)**2).sum()
+
+    res = minimize(obj, x0, method="SLSQP", bounds=bnds, constraints=cons)
+    if not res.success:
+        return pd.Series(x0, index=cov.index)
+    return pd.Series(res.x, index=cov.index)
+
+# ============================================================
+# 回测
+
+def get_quarter(dt):
+    m = dt.month
+    return f"{dt.year}Q{(m-1)//3 + 1}"
+
+all_dates = daily_ret.index
+all_funds = daily_ret.columns.tolist()
+start_date = pd.Timestamp("2022-01-01")
+valid_dates = all_dates[all_dates >= start_date]
+if len(valid_dates) == 0:
+    raise ValueError("没有找到2022-01-01之后的数据")
+
+# === 新增：按分类存储结果 ===
+clusters = ["0", "1","2","3","4","5"]  # 根据你的聚类值定义
+results = {}
+
+for cluster in clusters:
+    results[cluster] = {
+        'nav': pd.Series(1.0, index=valid_dates),
+        'weights': pd.DataFrame(0.0, index=valid_dates, columns=all_funds)
+    }
+
+
+lookback = 20
+for i, today in enumerate(valid_dates):
+    q = get_quarter(today)
+
+    # 分别处理每个分类
+    # for cluster in clusters:
+    #     allowed = [
+    #         f for f in all_funds
+    #         if fund_quarter.get(f) == q and str(fund_cluster.get(f)) == cluster
+    #     ]
+    for cluster in clusters:
+        allowed = [
+            f for f in all_funds
+            if fund_quarter.get(f) == q and (
+                # 债券型基金：只筛选时间，不筛选聚类
+                    is_bond_fund(f) or
+                    # 非债券型基金：既筛选时间也筛选聚类
+                    str(fund_cluster.get(f)) == cluster
+            )
+        ]
+
+        # 强制添加 ALWAYS_ALLOWED（只在当前分类中）
+        allowed = sorted(list(set(allowed) | (set(ALWAYS_ALLOWED) & set(all_funds))))
+
+        if len(allowed) == 0:
+            continue
+        elif len(allowed) == 1:
+            results[cluster]['weights'].loc[today, allowed[0]] = 1.0
+        else:
+            # 取历史
+            idx_in_all = all_dates.get_loc(today)
+            start = max(0, idx_in_all - lookback)
+            hist = daily_ret.iloc[start:idx_in_all][allowed].dropna(how="all")
+
+            # 去重列名, 防止 duplicate
+            hist = hist.loc[:, ~hist.columns.duplicated()]
+
+            if hist.shape[0] < 5:
+                w = pd.Series(1 / len(allowed), index=allowed)
+            else:
+                cov = hist.cov()
+
+                # 去掉协方差矩阵中的重复列
+                cov = cov.loc[~cov.index.duplicated(), ~cov.columns.duplicated()]
+
+                # 删除不可用列
+                valid_cols = cov.columns[cov.notna().all()]
+                cov = cov.loc[valid_cols, valid_cols]
+
+                if len(cov) == 0:
+                    w = pd.Series(1 / len(allowed), index=allowed)
+                else:
+                    # bond_funds_in_cov = [f for f in cov.columns if is_bond_fund(f)]
+                    # if bond_funds_in_cov:
+                    #     print(f"日期 {today}, 聚类 {cluster}: 债券基金在协方差矩阵中: {bond_funds_in_cov}")
+                    #     for bond_fund in bond_funds_in_cov:
+                    #         bond_vol = cov.loc[bond_fund, bond_fund]  # 债券基金方差
+                    #         bond_std = np.sqrt(bond_vol)  # 债券基金标准差
+                    #         print(f"  {bond_fund}: 方差={bond_vol:.6f}, 标准差={bond_std:.4f}")
+
+                    w_part = risk_parity_weights(cov, allowed_funds=allowed, always_allowed=ALWAYS_ALLOWED)
+
+                    # 安全对齐，不再用 reindex
+                    w = pd.Series(0.0, index=allowed)
+                    for f in w_part.index:
+                        if f in w.index:
+                            w[f] = w_part[f]
+
+                    if w.sum() <= 0:
+                        w[:] = 1 / len(allowed)
+                    else:
+                        w /= w.sum()
+
+            results[cluster]['weights'].loc[today] = w
+
+        # NAV 更新（每个分类独立更新）
+        if i > 0:
+            r = (results[cluster]['weights'].loc[today] * daily_ret.loc[today]).sum()
+            results[cluster]['nav'].iloc[i] = results[cluster]['nav'].iloc[i - 1] * (1 + r)
+
+    # ============================================================
+    # 输出
+    # ============================================================
+with pd.ExcelWriter("risk_parity_output.xlsx") as writer:
+    # 输出每个分类的净值和权重
+    for cluster in clusters:
+        results[cluster]['nav'].to_frame(f"NAV_Cluster{cluster}").to_excel(
+            writer, sheet_name=f"净值_类{cluster}")
+        results[cluster]['weights'].to_excel(
+            writer, sheet_name=f"权重_类{cluster}")
+
+print("DONE → risk_parity_output.xlsx")
