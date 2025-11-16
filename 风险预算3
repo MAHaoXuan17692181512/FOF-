@@ -1,0 +1,353 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import openpyxl
+import os
+
+file = r"C:\Users\cufet\Desktop\最优基金选择结果_2022-2025.xlsx"
+ALWAYS_ALLOWED = ["518880", "270042"]
+
+# ===================== 风险预算 =====================
+CATEGORY_RISK_BUDGET = {
+    "股票型": 0.60,
+    "债券型": 0.10,
+    "混合型": 0.20,
+    "商品型": 0.05,
+    "QDII": 0.05
+}
+RISK_BUDGET = CATEGORY_RISK_BUDGET
+
+# ===================== 读取 Excel =====================
+raw = pd.read_excel(file, sheet_name="Sheet1", header=None, dtype=object)
+nrows, ncols = raw.shape
+
+def find_meta_row_by_firstcol(keywords):
+    for i in range(20):
+        v = raw.iat[i, 0]
+        if pd.isna(v):
+            continue
+        s = str(v).strip().lower()
+        for kw in keywords:
+            if kw.lower() in s:
+                return i
+    return None
+
+row_fundcode = find_meta_row_by_firstcol(["基金代码"])
+row_cluster = find_meta_row_by_firstcol(["聚类"])
+row_quarter = find_meta_row_by_firstcol(["季度"])
+row_fundname = find_meta_row_by_firstcol(["基金名称"])
+row_fundtype = find_meta_row_by_firstcol(["基金类型"])
+
+if row_fundcode is None:
+    raise ValueError("找不到基金代码行")
+
+# ===================== 日期开始行 =====================
+date_start = None
+for i in range(row_fundcode + 1, nrows):
+    dt = pd.to_datetime(raw.iat[i, 0], errors='coerce')
+    if not pd.isna(dt):
+        date_start = i
+        break
+if date_start is None:
+    raise ValueError("找不到日期开始行")
+
+# ===================== 基金列 =====================
+fund_cols = []
+fund_codes = {}
+for c in range(1, ncols):
+    v = raw.iat[row_fundcode, c]
+    if pd.isna(v):
+        continue
+    code = str(v).strip()
+    fund_cols.append(c)
+    fund_codes[c] = code
+
+# 去重基金代码
+unique_cols = []
+seen = set()
+for c in fund_cols:
+    cd = fund_codes[c]
+    if cd not in seen:
+        seen.add(cd)
+        unique_cols.append(c)
+fund_cols = unique_cols
+
+# ===================== NAV 数据 =====================
+dates = pd.to_datetime(raw.iloc[date_start:, 0], errors='coerce')
+valid_mask = ~dates.isna()
+dates = dates[valid_mask].reset_index(drop=True)
+
+nav_part = raw.iloc[date_start:, fund_cols].loc[valid_mask].reset_index(drop=True)
+nav_part = nav_part.apply(pd.to_numeric, errors="coerce")
+nav_part.index = dates
+nav_part.columns = [fund_codes[c] for c in fund_cols]
+
+daily_ret = nav_part.pct_change().dropna(how="all")
+
+# ===================== 元信息 =====================
+def get_meta(row, c):
+    if row is None:
+        return None
+    v = raw.iat[row, c]
+    return None if pd.isna(v) else str(v).strip()
+
+def is_bond_fund(fund_code):
+    fund_type_str = fund_type.get(fund_code, "")
+    if not fund_type_str:
+        return False
+    exclude_keywords = ["股", "商品", "QDII","混合"]
+    for keyword in exclude_keywords:
+        if keyword in fund_type_str:
+            return False
+    return True
+
+def get_fund_category(fund_code):
+    fund_type_str = fund_type.get(fund_code, "")
+    if not fund_type_str:
+        return "其他"
+    if "股票" in fund_type_str or "股" in fund_type_str:
+        return "股票型"
+    elif "债" in fund_type_str:
+        return "债券型"
+    elif "混合" in fund_type_str:
+        return "混合型"
+    elif "商品" in fund_type_str or "黄金" in fund_type_str:
+        return "商品型"
+    elif "QDII" in fund_type_str or "纳斯达克" in fund_type_str:
+        return "QDII"
+    else:
+        return "其他"
+
+fund_quarter = {fund_codes[c]: get_meta(row_quarter, c) for c in fund_cols}
+fund_cluster = {fund_codes[c]: get_meta(row_cluster, c) for c in fund_cols}
+fund_type = {fund_codes[c]: get_meta(row_fundtype, c) for c in fund_cols}
+
+# ===================== 风险预算优化 =====================
+def risk_budget_weights(cov):
+    funds = cov.index.tolist()
+    n = len(funds)
+    cov_mat = cov.values
+    categories = [get_fund_category(f) for f in funds]
+
+    risk_budget_vector = np.zeros(n)
+    from collections import Counter
+    count_by_cat = Counter(categories)
+    for i, cat in enumerate(categories):
+        cat_budget = CATEGORY_RISK_BUDGET.get(cat, 0.0)
+        risk_budget_vector[i] = cat_budget / count_by_cat[cat] if count_by_cat[cat] > 0 else 0.0
+    risk_budget_vector /= risk_budget_vector.sum()
+    x0 = np.ones(n) / n
+    cons = [{'type': 'eq', 'fun': lambda w: w.sum() - 1}]
+    bounds = [(0, 1)] * n
+
+    def objective(w):
+        port_vol = np.sqrt(w @ cov_mat @ w)
+        if port_vol < 1e-12:
+            return 1e12
+        marginal_contrib = cov_mat @ w
+        risk_contrib = w * marginal_contrib
+        rc_fraction = risk_contrib / (port_vol ** 2)
+        return ((rc_fraction - risk_budget_vector)**2).sum()
+
+    res = minimize(objective, x0, constraints=cons, bounds=bounds, method="SLSQP")
+    if not res.success:
+        return pd.Series(np.ones(n)/n, index=funds)
+    return pd.Series(res.x, index=funds)
+
+# ===================== 回测 =====================
+def get_quarter(dt):
+    m = dt.month
+    return f"{dt.year}Q{(m - 1) // 3 + 1}"
+
+all_dates = daily_ret.index
+all_funds = daily_ret.columns.tolist()
+start_date = pd.Timestamp("2022-01-01")
+valid_dates = all_dates[all_dates >= start_date]
+
+clusters = ["0", "1"]
+results = {}
+holdings = {c: pd.DataFrame(index=valid_dates, columns=all_funds, dtype=float) for c in clusters}
+real_weights = {c: pd.DataFrame(index=valid_dates, columns=all_funds, dtype=float) for c in clusters}
+
+for cluster in clusters:
+    results[cluster] = {
+        'nav': pd.Series(100.0, index=valid_dates),
+        'weights': pd.DataFrame(0.0, index=valid_dates, columns=all_funds)
+    }
+
+lookback = 20
+FEE_RATE = 0.001
+
+# ===================== 调仓日期 =====================
+quarter_dates = []
+current_quarter = None
+for today in valid_dates:
+    q = get_quarter(today)
+    if q != current_quarter:
+        quarter_dates.append(today)
+        current_quarter = q
+
+optimization_cache = {}
+
+for i, rebalance_date in enumerate(quarter_dates):
+    for cluster in clusters:
+        today = rebalance_date
+        q = get_quarter(today)
+        allowed = []
+        for f in all_funds:
+            if fund_quarter.get(f) != q:
+                continue
+            cat = get_fund_category(f)
+            if cat == "股票型" or is_bond_fund(f):
+                allowed.append(f)
+            else:
+                allowed.append(f)
+        allowed = sorted(list(set(allowed) | (set(ALWAYS_ALLOWED) & set(all_funds))))
+        if len(allowed) == 0:
+            continue
+        elif len(allowed) == 1:
+            w = pd.Series(1.0, index=allowed)
+        else:
+            idx_in_all = all_dates.get_loc(today)
+            start = max(0, idx_in_all - lookback)
+            hist = daily_ret.iloc[start:idx_in_all][allowed].dropna(how="all")
+            hist = hist.loc[:, ~hist.columns.duplicated()]
+            if hist.shape[0] < 5:
+                w = pd.Series(1 / len(allowed), index=allowed)
+            else:
+                cov = hist.cov()
+                cov = cov.loc[~cov.index.duplicated(), ~cov.columns.duplicated()]
+                valid_cols = cov.columns[cov.notna().all()]
+                cov = cov.loc[valid_cols, valid_cols]
+                if len(cov) == 0:
+                    w = pd.Series(1 / len(allowed), index=allowed)
+                else:
+                    cache_key = f"{q}_{cluster}_{tuple(sorted(allowed))}"
+                    if cache_key in optimization_cache:
+                        w_part = optimization_cache[cache_key]
+                    else:
+                        w_part = risk_budget_weights(cov)
+                        optimization_cache[cache_key] = w_part
+                    w = pd.Series(0.0, index=allowed)
+                    for f in w_part.index:
+                        if f in w.index:
+                            w[f] = w_part[f]
+                    w /= w.sum()
+
+
+        # ====== 调仓日处理 ======
+        prev_candidates = valid_dates[valid_dates < today]
+        if len(prev_candidates) == 0:
+            # 第一次调仓日
+            cluster_nav = 100.0  # 初始 NAV
+            prev_holding = pd.Series(0.0, index=all_funds)
+        else:
+            prev_day = prev_candidates[-1]
+            cluster_nav = results[cluster]['nav'].loc[prev_day]  # 前一天 NAV
+            prev_holding = holdings[cluster].loc[prev_day].fillna(0)
+
+        # 计算目标持仓金额
+        target_value = w.reindex(all_funds, fill_value=0) * cluster_nav
+        fee = (target_value - prev_holding).abs().sum() * FEE_RATE
+        cluster_nav -= fee  # 扣手续费
+
+        # 更新 NAV 和 holdings
+        results[cluster]['nav'].loc[today] = cluster_nav
+        holdings[cluster].loc[today] = target_value
+
+        # 当日持仓份额随收益率滚动
+        ret_today = daily_ret.loc[today].reindex(all_funds, fill_value=0)
+        holdings[cluster].loc[today] = holdings[cluster].loc[today] * (1 + ret_today)
+        real_weights[cluster].loc[today] = holdings[cluster].loc[today] / holdings[cluster].loc[today].sum()
+
+        # ====== 应用到整个季度 ======
+        next_rebalance = quarter_dates[i + 1] if i + 1 < len(quarter_dates) else valid_dates[-1]
+        mask_dates = valid_dates[(valid_dates > today) & (valid_dates < next_rebalance)]
+
+        prev_holding = holdings[cluster].loc[today]  # 调仓日持仓作为起点
+
+        for date_idx in mask_dates:
+            # 当天收益
+            daily_ret_today = daily_ret.loc[date_idx].reindex(all_funds, fill_value=0)
+
+            # 当天持仓 = 昨日持仓 * (1 + 收益)
+            holdings_today = prev_holding * (1 + daily_ret_today)
+            holdings[cluster].loc[date_idx] = holdings_today
+
+            # 当天组合价值
+            total_value = holdings_today.sum()
+            results[cluster]['nav'].loc[date_idx] = total_value
+
+            # 当天真实权重 = 当天持仓金额 / 总价值
+            real_weights[cluster].loc[date_idx] = holdings_today / total_value
+
+            # 权重表（仅记录目标权重，不是实际权重）
+            results[cluster]['weights'].loc[date_idx] = w.reindex(all_funds, fill_value=0)
+
+            # 更新 prev_holding，为下一天使用
+            prev_holding = holdings_today
+# ---------- 诊断段：打印调仓与 NAV 变化信息 ----------
+print("\n--- 回测诊断开始 ---")
+summary = []
+total_fees_by_cluster = {c: 0.0 for c in clusters}
+# 我们需要重新走一遍 quarter_dates，计算每次调仓的 fee（如果你已在代码中计算 fee，请确保变量可见）
+for i, rebalance_date in enumerate(quarter_dates):
+    for cluster in clusters:
+        today = rebalance_date
+        # 读取 NAV、持仓（如果存在）
+        nav_today = results[cluster]['nav'].loc[today] if today in results[cluster]['nav'].index else None
+        hold_today = None
+        try:
+            hold_today = holdings[cluster].loc[today]
+        except Exception:
+            hold_today = None
+        # 计算当日总持仓价值（如果有）
+        total_hold_val = hold_today.sum() if (hold_today is not None and not hold_today.isna().all()) else np.nan
+
+        # 查找上一次非空持仓日期（如果有）
+        prev_days = valid_dates[valid_dates < today]
+        prev_day = prev_days[-1] if len(prev_days) > 0 else None
+        prev_hold = holdings[cluster].loc[prev_day].fillna(0) if (prev_day is not None) else pd.Series(0, index=all_funds)
+
+        # 目标权重（你原逻辑里计算 w 时覆盖，尝试从 results.weights 取调仓日前一日或当天）
+        target_w = None
+        if today in results[cluster]['weights'].index and (results[cluster]['weights'].loc[today].abs().sum() > 0):
+            target_w = results[cluster]['weights'].loc[today]
+        else:
+            # 尝试看前一日
+            try:
+                target_w = results[cluster]['weights'].loc[prev_day]
+            except Exception:
+                target_w = None
+
+        if target_w is not None:
+            target_value = target_w.reindex(all_funds, fill_value=0) * nav_today if nav_today is not None else None
+            fee_amount = (target_value - prev_hold).abs().sum() * FEE_RATE if target_value is not None else np.nan
+        else:
+            fee_amount = np.nan
+
+        if not np.isnan(fee_amount):
+            total_fees_by_cluster[cluster] += fee_amount
+
+        print(f"Rebal {i+1} {today.date()} Cluster {cluster} | NAV_today={nav_today:.6g} | hold_sum={total_hold_val:.6g} | fee={fee_amount:.6g}")
+
+# 打印 NAV 时间序列的统计，看看是否在回测中被“压缩”
+for cluster in clusters:
+    nav_series = results[cluster]['nav']
+    print(f"\nCluster {cluster} NAV统计: 首={nav_series.iloc[0]:.6g}, 末={nav_series.iloc[-1]:.6g}, min={nav_series.min():.6g}, max={nav_series.max():.6g}")
+
+print("累计手续费（估计）:", total_fees_by_cluster)
+print("--- 回测诊断完成 ---\n")
+
+
+# ===================== 输出 =====================
+output_file = "risk_budget_output_fixed.xlsx"
+with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    for cluster in clusters:
+        results[cluster]['nav'].to_frame(f"NAV_Cluster{cluster}").to_excel(writer, sheet_name=f"净值_类{cluster}")
+        results[cluster]['weights'].to_excel(writer, sheet_name=f"季度权重_类{cluster}")
+        real_weights[cluster].to_excel(writer, sheet_name=f"真实每日权重_类{cluster}")
+        holdings[cluster].to_excel(writer, sheet_name=f"每日持仓金额_类{cluster}")
+    pd.DataFrame.from_dict(RISK_BUDGET, orient='index', columns=['风险预算']).to_excel(writer, sheet_name="风险预算配置")
+
+print(f"修复版输出完成: {output_file}")
