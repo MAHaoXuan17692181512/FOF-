@@ -1,0 +1,460 @@
+import akshare as ak
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+
+# 尝试导入Tushare
+try:
+    import tushare as ts
+    TUSHARE_AVAILABLE = True
+except ImportError:
+    TUSHARE_AVAILABLE = False
+    print("⚠️  未安装Tushare，将只使用AkShare数据源")
+
+warnings.filterwarnings('ignore')
+
+print("=" * 80)
+print("基金跟踪误差分析系统 - 增强版（支持Tushare）")
+print("=" * 80)
+
+# ============================================================================
+# 配置参数
+# ============================================================================
+
+# 【重要】在此处填入你的Tushare Token
+TUSHARE_TOKEN = "0ac756bd497019bbec12301ae2802f410f9a5019d4071cca2c2cfc91"  # ⬅️ 替换为你的token
+#这里本质上没有用到这个TUSHARE_TOKEN的接口
+START_DATE = "20200101"
+END_DATE = "20251030"
+OUTPUT_FILE = "基金跟踪分析结果.xlsx"
+
+# 手动指定代表性基金
+FUND_CONFIG = {
+    '黄金': [
+        '518850', '518880', '159937', '159934', '001631',
+        '000218', '004253', '000929'
+    ],
+    '纳斯达克': [
+        '513100', '159941', '160213', '000834', '270042',
+        '040046', '002891', '161130'
+    ],
+    '货币': [
+        # 场内货币基金
+        '511990', '511880', '511660', '159001',
+        # 场外货币基金
+        '000198', '003474', '000773', '519888', '000836',
+        '001231', '000464', '000539', '000343', '000389',
+        '000359', '050003', '202301', '240006', '270004', '000397'
+    ]
+}
+
+# 场内基金代码映射（用于Tushare）
+MARKET_CODE_MAPPING = {
+    '511990': '511990.SH',  # 华宝添益
+    '511880': '511880.SH',  # 银华日利
+    '511660': '511660.SH',  # 建信添益
+    '159001': '159001.SZ',  # 易方达保证金货币
+    '518850': '518850.SH',  # 黄金基金
+    '518880': '518880.SH',
+    '159937': '159937.SZ',
+    '159934': '159934.SZ',
+    '513100': '513100.SH',
+    '159941': '159941.SZ',
+    '160213': '160213.SZ',
+}
+
+# 初始化Tushare
+ts_pro = None
+if TUSHARE_AVAILABLE and TUSHARE_TOKEN != "your_tushare_token_here":
+    try:
+        ts.set_token(TUSHARE_TOKEN)
+        ts_pro = ts.pro_api()
+        print("✓ Tushare初始化成功")
+    except Exception as e:
+        print(f"✗ Tushare初始化失败: {e}")
+        ts_pro = None
+elif TUSHARE_AVAILABLE:
+    print("⚠️  请在代码中配置TUSHARE_TOKEN")
+
+
+# ============================================================================
+# 工具函数 - Tushare数据获取
+# ============================================================================
+
+def get_fund_data_tushare(fund_code, start_date, end_date):
+    """
+    使用Tushare获取基金数据
+    """
+    if ts_pro is None:
+        return None
+
+    try:
+        # 判断是场内还是场外
+        if fund_code in MARKET_CODE_MAPPING:
+            # 场内基金 - 使用fund_daily接口
+            ts_code = MARKET_CODE_MAPPING[fund_code]
+            df = ts_pro.fund_daily(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date
+            )
+        else:
+            # 场外基金 - 使用fund_nav接口
+            # Tushare的场外基金代码不需要后缀
+            df = ts_pro.fund_nav(
+                ts_code=fund_code,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+        if df is not None and len(df) > 0:
+            # 统一列名
+            if 'trade_date' in df.columns:
+                df = df[['trade_date', 'close']].copy()
+                df.columns = ['date', 'close']
+            elif 'end_date' in df.columns and 'unit_nav' in df.columns:
+                df = df[['end_date', 'unit_nav']].copy()
+                df.columns = ['date', 'close']
+            elif 'nav_date' in df.columns and 'unit_nav' in df.columns:
+                df = df[['nav_date', 'unit_nav']].copy()
+                df.columns = ['date', 'close']
+            else:
+                return None
+
+            df['date'] = pd.to_datetime(df['date'])
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df = df.dropna()
+            df = df.sort_values('date').reset_index(drop=True)
+
+            return df if len(df) >= 100 else None
+
+    except Exception as e:
+        # 静默失败，让其他数据源尝试
+        pass
+
+    return None
+
+
+# ============================================================================
+# 工具函数 - AkShare数据获取（原有功能）
+# ============================================================================
+
+def safe_get_fund_data(fund_code, start_date, end_date):
+    """
+    安全获取基金净值数据
+    优先级: Tushare > AkShare场外 > AkShare场内
+    """
+    # 方法0: 尝试Tushare（如果可用）
+    if ts_pro is not None:
+        data = get_fund_data_tushare(fund_code, start_date, end_date)
+        if data is not None:
+            print(f"    [Tushare] ", end="")
+            return data
+
+    # 方法1: AkShare场外基金净值
+    try:
+        df = ak.fund_open_fund_info_em(symbol=fund_code, indicator="单位净值走势")
+        if df is not None and len(df) > 0:
+            df = df[['净值日期', '单位净值']].copy()
+            df.columns = ['date', 'close']
+            df['date'] = pd.to_datetime(df['date'])
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+
+            # 筛选日期范围
+            start = pd.to_datetime(start_date)
+            end = pd.to_datetime(end_date)
+            df = df[(df['date'] >= start) & (df['date'] <= end)]
+            df = df.dropna()
+            df = df.sort_values('date').reset_index(drop=True)
+
+            if len(df) >= 100:
+                print(f"    [AkShare场外] ", end="")
+                return df
+    except:
+        pass
+
+    # 方法2: AkShare场内ETF行情
+    try:
+        df = ak.fund_etf_hist_em(
+            symbol=fund_code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq"###这里非常好 用的前复权
+        )
+        if df is not None and len(df) > 0:
+            df = df[['日期', '收盘']].copy()
+            df.columns = ['date', 'close']
+            df['date'] = pd.to_datetime(df['date'])
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df = df.dropna()
+            df = df.sort_values('date').reset_index(drop=True)
+
+            if len(df) >= 100:
+                print(f"    [AkShare场内] ", end="")
+                return df
+    except Exception as e:
+        pass
+
+    return None
+
+
+def safe_get_index_data(index_type, start_date, end_date):
+    """
+    安全获取指数数据
+    """
+    try:
+        if index_type == '黄金':
+            # 尝试多个黄金数据源
+            try:
+                # 黄金期货主力
+                df = ak.futures_main_sina(symbol="AU0", start_date=start_date, end_date=end_date)
+                if df is not None and len(df) > 0:
+                    return df[['date', 'close']].copy()
+            except:
+                pass
+
+            try:
+                # 上海黄金交易所现货价格
+                df = ak.spot_hist_sge(symbol="Au99.99")
+                if df is not None and len(df) > 0:
+                    df = df[['date', 'close']].copy()
+                    df['date'] = pd.to_datetime(df['date'])
+                    return df
+            except:
+                pass
+
+        elif index_type == '纳斯达克':
+            # 纳斯达克综合指数
+            df = ak.index_us_stock_sina(symbol=".IXIC")
+            if df is not None and len(df) > 0:
+                df = df[['date', 'close']].copy()
+                df['date'] = pd.to_datetime(df['date'])
+                start = pd.to_datetime(start_date)
+                end = pd.to_datetime(end_date)
+                df = df[(df['date'] >= start) & (df['date'] <= end)]
+                return df
+
+        elif index_type == '货币':
+            # 使用上证国债指数作为货币市场指数
+            df = ak.stock_zh_index_daily(symbol="sh000012")
+            if df is not None and len(df) > 0:
+                df = df[['date', 'close']].copy()
+                df['date'] = pd.to_datetime(df['date'])
+                start = pd.to_datetime(start_date)
+                end = pd.to_datetime(end_date)
+                df = df[(df['date'] >= start) & (df['date'] <= end)]
+                return df
+
+    except Exception as e:
+        print(f"  获取{index_type}指数失败: {str(e)[:50]}")
+
+    return None
+
+
+def calculate_tracking_error(fund_data, index_data):
+    """
+    计算跟踪误差
+    """
+    # 合并数据
+    merged = pd.merge(fund_data, index_data, on='date', how='inner', suffixes=('_fund', '_index'))
+
+    if len(merged) < 50:
+        return None, None, None, None
+
+    # 计算收益率
+    merged['R_fund'] = merged['close_fund'].pct_change()
+    merged['R_index'] = merged['close_index'].pct_change()
+
+    # 计算跟踪偏离度
+    merged['TD'] = merged['R_fund'] - merged['R_index']
+
+    # 去除NaN
+    merged = merged.dropna()
+
+    if len(merged) < 50:
+        return None, None, None, None
+
+    # 跟踪误差 = 跟踪偏离度的标准差
+    TE = merged['TD'].std()
+    TE_annual = TE * np.sqrt(252)
+    TD_mean = merged['TD'].mean()
+
+    return TE, TE_annual, TD_mean, len(merged)
+
+
+# ============================================================================
+# 主流程
+# ============================================================================
+
+print("\n[1/5] 获取基金数据...")
+
+fund_data_dict = {}
+index_mapping = {
+    '黄金': 'AU9999',
+    '纳斯达克': 'NASDAQ',
+    '货币': 'MONEY'
+}
+
+for fund_type, fund_codes in FUND_CONFIG.items():
+    print(f"\n  {fund_type}型基金:")
+    count = 0
+
+    for code in fund_codes:
+        data = safe_get_fund_data(code, START_DATE, END_DATE)
+        if data is not None:
+            # 获取基金名称
+            try:
+                info = ak.fund_individual_basic_info_xq(symbol=code)
+                name = info.loc[info['item'] == '基金简称', 'value'].values[0]
+            except:
+                name = f"基金{code}"
+
+            fund_data_dict[code] = {
+                'name': name,
+                'type': fund_type,
+                'data': data
+            }
+            count += 1
+            print(f"✓ {code} {name}: {len(data)} 条数据")
+
+    print(f"    共获取 {count} 只")
+
+print(f"\n  总计获取 {len(fund_data_dict)} 只基金数据")
+
+# ============================================================================
+print("\n[2/5] 获取指数数据...")
+
+index_data_dict = {}
+
+for index_name, index_code in [('黄金', 'AU9999'), ('纳斯达克', 'NASDAQ'), ('货币', 'MONEY')]:
+    print(f"  - 获取{index_name}指数...")
+    data = safe_get_index_data(index_name, START_DATE, END_DATE)
+
+    if data is not None:
+        index_data_dict[index_code] = {
+            'name': f'{index_name}指数',
+            'data': data
+        }
+        print(f"    ✓ 获取 {len(data)} 条数据")
+    else:
+        print(f"    ✗ 获取失败")
+
+# ============================================================================
+print("\n[3/5] 计算跟踪误差...")
+
+tracking_results = []
+
+for fund_code, fund_info in fund_data_dict.items():
+    fund_type = fund_info['type']
+    fund_name = fund_info['name']
+    fund_data = fund_info['data']
+
+    # 获取对应指数
+    index_code = index_mapping.get(fund_type)
+    if index_code not in index_data_dict:
+        continue
+
+    index_data = index_data_dict[index_code]['data']
+
+    # 计算跟踪误差
+    TE, TE_annual, TD_mean, sample_size = calculate_tracking_error(fund_data, index_data)
+
+    if TE is not None:
+        tracking_results.append({
+            '基金代码': fund_code,
+            '基金名称': fund_name,
+            '基金类型': fund_type,
+            '跟踪指数': index_data_dict[index_code]['name'],
+            '跟踪误差TE': TE,
+            '年化跟踪误差': TE_annual,
+            '平均偏离度TD': TD_mean,
+            '样本数': sample_size
+        })
+        print(f"  ✓ {fund_code} {fund_name}: TE={TE_annual * 100:.2f}%")
+
+tracking_df = pd.DataFrame(tracking_results)
+print(f"\n  成功计算 {len(tracking_df)} 只基金")
+
+# ============================================================================
+print("\n[4/5] 筛选最优基金...")
+
+best_funds = {}
+best_funds_list = []
+
+for fund_type in ['黄金', '纳斯达克', '货币']:
+    type_funds = tracking_df[tracking_df['基金类型'] == fund_type]
+
+    if len(type_funds) > 0:
+        best_fund = type_funds.loc[type_funds['跟踪误差TE'].idxmin()]
+        best_funds[fund_type] = best_fund
+        best_funds_list.append(best_fund.to_dict())
+
+        print(f"\n  {fund_type}型最优: {best_fund['基金代码']} {best_fund['基金名称']}")
+        print(f"    年化跟踪误差: {best_fund['年化跟踪误差'] * 100:.2f}%")
+
+# ============================================================================
+print("\n[5/5] 保存结果...")
+
+try:
+    with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+        # 1. 所有基金跟踪误差
+        if len(tracking_df) > 0:
+            df = tracking_df.sort_values('跟踪误差TE').reset_index(drop=True)
+            df.insert(0, '排名', range(1, len(df) + 1))
+            df.to_excel(writer, sheet_name='所有基金跟踪误差', index=False)
+            print(f"  ✓ Sheet 1: 所有基金跟踪误差 ({len(df)} 只)")
+
+        # 2. 最优基金汇总
+        if best_funds_list:
+            df = pd.DataFrame(best_funds_list)
+            df.to_excel(writer, sheet_name='最优基金汇总', index=False)
+            print(f"  ✓ Sheet 2: 最优基金汇总 ({len(df)} 只)")
+
+        # 3-5. 最优基金历史数据
+        sheet_num = 3
+        for fund_type, best_fund in best_funds.items():
+            code = best_fund['基金代码']
+            if code in fund_data_dict:
+                df = fund_data_dict[code]['data'].copy()
+                df = df.sort_values('date').reset_index(drop=True)
+                df['日期'] = df['date'].dt.strftime('%Y-%m-%d')
+                df['单位净值'] = df['close'].round(4)
+                df = df[['日期', '单位净值']]
+
+                sheet_name = f"{fund_type}最优_{code}"
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                print(f"  ✓ Sheet {sheet_num}: {sheet_name} ({len(df)} 条)")
+                sheet_num += 1
+
+        # 6-8. 指数数据
+        for idx_code, idx_info in index_data_dict.items():
+            df = idx_info['data'].copy()
+            df = df.sort_values('date').reset_index(drop=True)
+            df['日期'] = df['date'].dt.strftime('%Y-%m-%d')
+            df['收盘价'] = df['close'].round(2)
+            df = df[['日期', '收盘价']]
+
+            sheet_name = f"指数_{idx_code}"
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+            print(f"  ✓ Sheet {sheet_num}: {idx_info['name']} ({len(df)} 条)")
+            sheet_num += 1
+
+    print("\n" + "=" * 80)
+    print("✓ 分析完成!")
+    print("=" * 80)
+    print(f"\n结果文件: {OUTPUT_FILE}")
+
+    # 打印数据源统计
+    print("\n数据源使用统计:")
+    if ts_pro is not None:
+        print("  ✓ Tushare: 已启用")
+    else:
+        print("  ✗ Tushare: 未启用")
+    print("  ✓ AkShare: 已启用")
+
+except Exception as e:
+    print(f"\n✗ 保存失败: {e}")
+    import traceback
+    traceback.print_exc()
