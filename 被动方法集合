@@ -1,0 +1,1094 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+import openpyxl
+import os
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
+file = r"C:\Users\cufet\Desktop\最优基金选择结果_2022-2025.xlsx"
+ALWAYS_ALLOWED = ["518880", "270042"]
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ===================== 风险预算 =====================
+CATEGORY_RISK_BUDGET = {
+    "股票型": 0.60,
+    "债券型": 0.10,
+    "混合型": 0.20,
+    "商品型": 0.05,
+    "QDII": 0.05
+}
+RISK_BUDGET = CATEGORY_RISK_BUDGET
+
+# ===================== 读取 Excel =====================
+raw = pd.read_excel(file, sheet_name="Sheet1", header=None, dtype=object)
+nrows, ncols = raw.shape
+
+def find_meta_row_by_firstcol(keywords):
+    for i in range(20):
+        v = raw.iat[i, 0]
+        if pd.isna(v):
+            continue
+        s = str(v).strip().lower()
+        for kw in keywords:
+            if kw.lower() in s:
+                return i
+    return None
+
+row_fundcode = find_meta_row_by_firstcol(["基金代码"])
+row_cluster = find_meta_row_by_firstcol(["聚类"])
+row_quarter = find_meta_row_by_firstcol(["季度"])
+row_fundname = find_meta_row_by_firstcol(["基金名称"])
+row_fundtype = find_meta_row_by_firstcol(["基金类型"])
+
+if row_fundcode is None:
+    raise ValueError("找不到基金代码行")
+
+# ===================== 日期开始行 =====================
+date_start = None
+for i in range(row_fundcode + 1, nrows):
+    dt = pd.to_datetime(raw.iat[i, 0], errors='coerce')
+    if not pd.isna(dt):
+        date_start = i
+        break
+if date_start is None:
+    raise ValueError("找不到日期开始行")
+
+# ===================== 基金列 =====================
+fund_cols = []
+fund_codes = {}
+for c in range(1, ncols):
+    v = raw.iat[row_fundcode, c]
+    if pd.isna(v):
+        continue
+    code = str(v).strip()
+    fund_cols.append(c)
+    fund_codes[c] = code
+
+# 去重基金代码
+unique_cols = []
+seen = set()
+for c in fund_cols:
+    cd = fund_codes[c]
+    if cd not in seen:
+        seen.add(cd)
+        unique_cols.append(c)
+fund_cols = unique_cols
+
+# ===================== NAV 数据 =====================
+dates = pd.to_datetime(raw.iloc[date_start:, 0], errors='coerce')
+valid_mask = ~dates.isna()
+dates = dates[valid_mask].reset_index(drop=True)
+
+nav_part = raw.iloc[date_start:, fund_cols].loc[valid_mask].reset_index(drop=True)
+nav_part = nav_part.apply(pd.to_numeric, errors="coerce")
+nav_part.index = dates
+nav_part.columns = [fund_codes[c] for c in fund_cols]
+
+daily_ret = nav_part.pct_change().dropna(how="all")
+
+# ===================== 元信息 =====================
+def get_meta(row, c):
+    if row is None:
+        return None
+    v = raw.iat[row, c]
+    return None if pd.isna(v) else str(v).strip()
+
+def is_bond_fund(fund_code):
+    fund_type_str = fund_type.get(fund_code, "")
+    if not fund_type_str:
+        return False
+    exclude_keywords = ["股", "商品", "QDII","混合"]
+    for keyword in exclude_keywords:
+        if keyword in fund_type_str:
+            return False
+    return True
+
+def get_fund_category(fund_code):
+    fund_type_str = fund_type.get(fund_code, "")
+    if not fund_type_str:
+        return "其他"
+    if "股票" in fund_type_str or "股" in fund_type_str:
+        return "股票型"
+    elif "债" in fund_type_str:
+        return "债券型"
+    elif "混合" in fund_type_str:
+        return "混合型"
+    elif "商品" in fund_type_str or "黄金" in fund_type_str:
+        return "商品型"
+    elif "QDII" in fund_type_str or "纳斯达克" in fund_type_str:
+        return "QDII"
+    else:
+        return "其他"
+
+fund_quarter = {fund_codes[c]: get_meta(row_quarter, c) for c in fund_cols}
+fund_cluster = {fund_codes[c]: get_meta(row_cluster, c) for c in fund_cols}
+fund_type = {fund_codes[c]: get_meta(row_fundtype, c) for c in fund_cols}
+
+# ===================== 风险预算优化 =====================
+def risk_budget_weights(cov):
+    funds = cov.index.tolist()
+    n = len(funds)
+    cov_mat = cov.values
+    categories = [get_fund_category(f) for f in funds]
+
+    risk_budget_vector = np.zeros(n)
+    from collections import Counter
+    count_by_cat = Counter(categories)
+    for i, cat in enumerate(categories):
+        cat_budget = CATEGORY_RISK_BUDGET.get(cat, 0.0)
+        risk_budget_vector[i] = cat_budget / count_by_cat[cat] if count_by_cat[cat] > 0 else 0.0
+    risk_budget_vector /= risk_budget_vector.sum()
+    x0 = np.ones(n) / n
+    cons = [{'type': 'eq', 'fun': lambda w: w.sum() - 1}]
+    bounds = [(0, 1)] * n
+
+    def objective(w):
+        port_vol = np.sqrt(w @ cov_mat @ w)
+        if port_vol < 1e-12:
+            return 1e12
+        marginal_contrib = cov_mat @ w
+        risk_contrib = w * marginal_contrib
+        rc_fraction = risk_contrib / (port_vol ** 2)
+        return ((rc_fraction - risk_budget_vector)**2).sum()
+
+    res = minimize(objective, x0, constraints=cons, bounds=bounds, method="SLSQP")
+    if not res.success:
+        return pd.Series(np.ones(n)/n, index=funds)
+    return pd.Series(res.x, index=funds)
+
+
+# ===================== 回测 =====================
+def get_quarter(dt):
+    m = dt.month
+    return f"{dt.year}Q{(m - 1) // 3 + 1}"
+
+all_dates = daily_ret.index
+all_funds = daily_ret.columns.tolist()
+start_date = pd.Timestamp("2022-01-01")
+valid_dates = all_dates[all_dates >= start_date]
+
+clusters = ["0"]
+results = {}
+holdings = {c: pd.DataFrame(index=valid_dates, columns=all_funds, dtype=float) for c in clusters}
+real_weights = {c: pd.DataFrame(index=valid_dates, columns=all_funds, dtype=float) for c in clusters}
+
+for cluster in clusters:
+    results[cluster] = {
+        'nav': pd.Series(100.0, index=valid_dates),
+        'weights': pd.DataFrame(0.0, index=valid_dates, columns=all_funds)
+    }
+
+lookback = 180
+FEE_RATE = 0.001
+
+# ===================== 调仓日期 =====================
+quarter_dates = []
+current_quarter = None
+for today in valid_dates:
+    q = get_quarter(today)
+    if q != current_quarter:
+        quarter_dates.append(today)
+        current_quarter = q
+
+optimization_cache = {}
+
+for i, rebalance_date in enumerate(quarter_dates):
+    for cluster in clusters:
+        today = rebalance_date
+        q = get_quarter(today)
+        allowed = []
+        for f in all_funds:
+            if fund_quarter.get(f) != q:
+                continue
+            cat = get_fund_category(f)
+            if cat == "股票型" or is_bond_fund(f):
+                allowed.append(f)
+            else:
+                allowed.append(f)
+        allowed = sorted(list(set(allowed) | (set(ALWAYS_ALLOWED) & set(all_funds))))
+        if len(allowed) == 0:
+            continue
+        elif len(allowed) == 1:
+            w = pd.Series(1.0, index=allowed)
+        else:
+            idx_in_all = all_dates.get_loc(today)
+            start = max(0, idx_in_all - lookback)
+            hist = daily_ret.iloc[start:idx_in_all][allowed].dropna(how="all")
+            hist = hist.loc[:, ~hist.columns.duplicated()]
+            if hist.shape[0] < 5:
+                w = pd.Series(1 / len(allowed), index=allowed)
+            else:
+                cov = hist.cov()
+                cov = cov.loc[~cov.index.duplicated(), ~cov.columns.duplicated()]
+                valid_cols = cov.columns[cov.notna().all()]
+                cov = cov.loc[valid_cols, valid_cols]
+                if len(cov) == 0:
+                    w = pd.Series(1 / len(allowed), index=allowed)
+                else:
+                    cache_key = f"{q}_{cluster}_{tuple(sorted(allowed))}"
+                    if cache_key in optimization_cache:
+                        w_part = optimization_cache[cache_key]
+                    else:
+                        w_part = risk_budget_weights(cov)
+                        optimization_cache[cache_key] = w_part
+                    w = pd.Series(0.0, index=allowed)
+                    for f in w_part.index:
+                        if f in w.index:
+                            w[f] = w_part[f]
+                    w /= w.sum()
+
+
+        # ====== 调仓日处理 ======
+        prev_candidates = valid_dates[valid_dates < today]
+        if len(prev_candidates) == 0:
+            # 第一次调仓日
+            cluster_nav = 100.0  # 初始 NAV
+            prev_holding = pd.Series(0.0, index=all_funds)
+        else:
+            prev_day = prev_candidates[-1]
+            cluster_nav = results[cluster]['nav'].loc[prev_day]  # 前一天 NAV
+            prev_holding = holdings[cluster].loc[prev_day].fillna(0)
+
+        # 计算目标持仓金额
+        target_value = w.reindex(all_funds, fill_value=0) * cluster_nav
+        fee = (target_value - prev_holding).abs().sum() * FEE_RATE
+        cluster_nav -= fee  # 扣手续费
+
+        # 更新 NAV 和 holdings
+        results[cluster]['nav'].loc[today] = cluster_nav
+        holdings[cluster].loc[today] = target_value
+
+        # 当日持仓份额随收益率滚动
+        ret_today = daily_ret.loc[today].reindex(all_funds, fill_value=0)
+        holdings[cluster].loc[today] = holdings[cluster].loc[today] * (1 + ret_today)
+        real_weights[cluster].loc[today] = holdings[cluster].loc[today] / holdings[cluster].loc[today].sum()
+
+        # ====== 应用到整个季度 ======
+        next_rebalance = quarter_dates[i + 1] if i + 1 < len(quarter_dates) else pd.Timestamp("2025-10-01")
+        mask_dates = valid_dates[(valid_dates > today) & (valid_dates < next_rebalance)]
+
+        prev_holding = holdings[cluster].loc[today]  # 调仓日持仓作为起点
+
+        for date_idx in mask_dates:
+            # 当天收益
+            daily_ret_today = daily_ret.loc[date_idx].reindex(all_funds, fill_value=0)
+
+            # 当天持仓 = 昨日持仓 * (1 + 收益)
+            holdings_today = prev_holding * (1 + daily_ret_today)
+            holdings[cluster].loc[date_idx] = holdings_today
+
+            # 当天组合价值
+            total_value = holdings_today.sum()
+            results[cluster]['nav'].loc[date_idx] = total_value
+
+            # 当天真实权重 = 当天持仓金额 / 总价值
+            real_weights[cluster].loc[date_idx] = holdings_today / total_value
+
+            # 权重表（仅记录目标权重，不是实际权重）
+            results[cluster]['weights'].loc[date_idx] = w.reindex(all_funds, fill_value=0)
+
+            # 更新 prev_holding，为下一天使用
+            prev_holding = holdings_today
+# ---------- 诊断段：打印调仓与 NAV 变化信息 ----------
+print("\n--- 回测诊断开始 ---")
+summary = []
+total_fees_by_cluster = {c: 0.0 for c in clusters}
+# 我们需要重新走一遍 quarter_dates，计算每次调仓的 fee（如果你已在代码中计算 fee，请确保变量可见）
+for i, rebalance_date in enumerate(quarter_dates):
+    for cluster in clusters:
+        today = rebalance_date
+        # 读取 NAV、持仓（如果存在）
+        nav_today = results[cluster]['nav'].loc[today] if today in results[cluster]['nav'].index else None
+        hold_today = None
+        try:
+            hold_today = holdings[cluster].loc[today]
+        except Exception:
+            hold_today = None
+        # 计算当日总持仓价值（如果有）
+        total_hold_val = hold_today.sum() if (hold_today is not None and not hold_today.isna().all()) else np.nan
+
+        # 查找上一次非空持仓日期（如果有）
+        prev_days = valid_dates[valid_dates < today]
+        prev_day = prev_days[-1] if len(prev_days) > 0 else None
+        prev_hold = holdings[cluster].loc[prev_day].fillna(0) if (prev_day is not None) else pd.Series(0, index=all_funds)
+
+        # 目标权重（你原逻辑里计算 w 时覆盖，尝试从 results.weights 取调仓日前一日或当天）
+        target_w = None
+        if today in results[cluster]['weights'].index and (results[cluster]['weights'].loc[today].abs().sum() > 0):
+            target_w = results[cluster]['weights'].loc[today]
+        else:
+            # 尝试看前一日
+            try:
+                target_w = results[cluster]['weights'].loc[prev_day]
+            except Exception:
+                target_w = None
+
+        if target_w is not None:
+            target_value = target_w.reindex(all_funds, fill_value=0) * nav_today if nav_today is not None else None
+            fee_amount = (target_value - prev_hold).abs().sum() * FEE_RATE if target_value is not None else np.nan
+        else:
+            fee_amount = np.nan
+
+        if not np.isnan(fee_amount):
+            total_fees_by_cluster[cluster] += fee_amount
+
+        print(f"Rebal {i+1} {today.date()} Cluster {cluster} | NAV_today={nav_today:.6g} | hold_sum={total_hold_val:.6g} | fee={fee_amount:.6g}")
+
+# 打印 NAV 时间序列的统计，看看是否在回测中被“压缩”
+for cluster in clusters:
+    nav_series = results[cluster]['nav']
+    print(f"\nCluster {cluster} NAV统计: 首={nav_series.iloc[0]:.6g}, 末={nav_series.iloc[-1]:.6g}, min={nav_series.min():.6g}, max={nav_series.max():.6g}")
+
+print("累计手续费（估计）:", total_fees_by_cluster)
+print("--- 回测诊断完成 ---\n")
+
+strategy_names = ["EqualWeight", "MinVariance", "MaxSharpe", "MaxDiversification"]
+rf = 0.014  # 无风险收益（年化），用于夏普（这里设为0，可按需修改）
+
+def equal_weight_solver(funds):
+    if len(funds) == 0:
+        return pd.Series(dtype=float)
+    w = np.ones(len(funds)) / len(funds)
+    return pd.Series(w, index=funds)
+
+def min_variance_solver(cov):
+    funds = cov.index.tolist()
+    n = len(funds)
+    cov_mat = cov.values
+    np.random.seed(42)  # 为了可重复性
+    x0 = np.random.random(n)
+    x0 = x0 / x0.sum()
+    cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1})
+    bounds = [(0, 1)] * n
+
+    def obj(w):
+        return float(w @ cov_mat @ w)
+
+    # 尝试SLSQP
+    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+
+    # 如果失败，尝试COBYLA（对约束处理较好）
+    if not res.success:
+        res = minimize(obj, x0, method="trust-constr", bounds=bounds, constraints=cons)
+
+    return pd.Series(res.x if res.success else np.ones(n) / n, index=funds)
+
+def max_sharpe_solver(ret_hist, cov):
+    """
+    ret_hist: daily returns DataFrame for the allowed funds (index dates, columns funds)
+    cov: covariance matrix (daily)
+    We compute expected returns as mean daily * 252 (annualized)
+    Covariance is annualized by *252
+    """
+    funds = cov.index.tolist()
+    n = len(funds)
+    if n == 0:
+        return pd.Series(dtype=float)
+    mu_daily = ret_hist[funds].mean()
+    mu = (mu_daily * 252).values  # annualized expected returns
+    cov_ann = cov.values * 252
+    np.random.seed(42)  # 为了可重复性
+    x0 = np.random.random(n)
+    x0 = x0 / x0.sum()
+    bounds = [(0, 1)] * n
+    cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1})
+
+    # maximize Sharpe -> minimize negative Sharpe
+    def obj(w):
+        port_ret = w @ mu
+        port_vol = np.sqrt(w @ cov_ann @ w)
+        if port_vol <= 0:
+            return 1e6
+        sharpe = (port_ret - rf) / port_vol
+        return -sharpe
+
+    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    if not res.success:
+        res = minimize(obj, x0, method="trust-constr", bounds=bounds, constraints=cons)
+
+    return pd.Series(res.x if res.success else np.ones(n) / n, index=funds)
+
+def max_diversification_solver(ret_hist, cov):
+    """
+    Maximize Diversification Ratio: DR(w) = (w' sigma) / sqrt(w' Σ w)
+    where sigma is vector of individual volatilities (annualized)
+    We minimize -DR(w)
+    """
+    funds = cov.index.tolist()
+    n = len(funds)
+    if n == 0:
+        return pd.Series(dtype=float)
+    sigma = np.sqrt(np.diag(cov.values) * 252)  # annualized individual vol
+    cov_ann = cov.values * 252
+    np.random.seed(42)  # 为了可重复性
+    x0 = np.random.random(n)
+    x0 = x0 / x0.sum()
+    bounds = [(0, 1)] * n
+    cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1})
+
+    def dr_obj(w):
+        w = np.array(w)
+        numerator = w @ sigma
+        denom = np.sqrt(w @ cov_ann @ w)
+        if denom <= 0:
+            return 1e6
+        dr = numerator / denom
+        return -dr  # minimize negative -> maximize dr
+
+    res = minimize(dr_obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    if not res.success:
+        res = minimize(dr_obj, x0, method="COBYLA", bounds=bounds, constraints=cons)
+    return pd.Series(res.x, index=funds)
+
+cov_cache = {}
+
+def _find_nearest_index_on_or_before(ts_index, dt):
+    """找到 ts_index 中 <= dt 的最后一个索引位置（整数索引），若没有返回 None。"""
+    if dt in ts_index:
+        return ts_index.get_loc(dt)
+    # 取小于等于 dt 的最后一个
+    le = ts_index[ts_index <= dt]
+    if len(le) == 0:
+        return None
+    return ts_index.get_loc(le[-1])
+
+def get_cov_for_quarter(q, allowed):
+    """
+    返回该季度使用的协方差矩阵（只计算一次并缓存）。
+    q: 'YYYYQn' 字符串
+    allowed: 当次调仓允许的基金列表（用于从历史数据中挑选列）
+    特殊：若 q == '2022Q1' 则使用 cov_date = 2022-01-25；否则使用季度第一天（rebalance_date 即为该季度第一天）
+    """
+    # 缓存 key 以季度 + allowed 列表排序为准，避免不同基金集合重复计算
+    key = (q, tuple(sorted(allowed)))
+    if key in cov_cache:
+        return cov_cache[key]
+
+    # 选择计算协方差的基准日期 cov_date
+    if q == "2022Q1":
+        cov_date = pd.Timestamp("2022-01-25")
+    else:
+        # 找到 quarter_dates 中对应 q 的那天（quarter_dates 在外部已定义）
+        # 如果找不到（理论上不会），退回到第一个 >= 该季度的 valid_dates
+        matching = [d for d in quarter_dates if get_quarter(d) == q]
+        cov_date = matching[0] if len(matching) > 0 else None
+        if cov_date is None:
+            # 退化：取该季度第一个 valid_dates
+            cov_date = valid_dates[valid_dates.map(lambda d: get_quarter(d) == q)][0]
+
+    # 确保 cov_date 在 daily_ret.index 或取其之前最近的一个可用交易日
+    cov_idx = _find_nearest_index_on_or_before(daily_ret.index, cov_date)
+    if cov_idx is None:
+        # 没有可用历史数据
+        cov_cache[key] = pd.DataFrame()
+        return cov_cache[key]
+    cov_dt = daily_ret.index[cov_idx]
+
+    # 计算历史窗口起点索引（与原逻辑使用相同的 lookback）
+    start_idx = max(0, cov_idx - lookback)
+    hist = daily_ret.iloc[start_idx:cov_idx + 1][allowed].dropna(how="all")
+    hist = hist.loc[:, ~hist.columns.duplicated()]
+
+    if hist.shape[0] < 5:
+        cov_mat = pd.DataFrame()  # insufficient data
+    else:
+        cov_mat = hist.cov()
+        cov_mat = cov_mat.loc[~cov_mat.index.duplicated(), ~cov_mat.columns.duplicated()]
+        valid_cols = cov_mat.columns[cov_mat.notna().all()]
+        cov_mat = cov_mat.loc[valid_cols, valid_cols]
+
+    cov_cache[key] = cov_mat
+    return cov_mat
+
+# 初始化结果容器
+strat_results = {s: {'nav': pd.Series(100.0, index=valid_dates),
+                     'weights': pd.DataFrame(0.0, index=valid_dates, columns=all_funds),
+                     'holdings': pd.DataFrame(0.0, index=valid_dates, columns=all_funds),
+                     'real_weights': pd.DataFrame(0.0, index=valid_dates, columns=all_funds)}
+                 for s in strategy_names}
+
+# 用和主逻辑一致的 reblance 日期 quarter_dates, lookback, FEE_RATE
+# 对每个 rebalancing date 做权重计算并应用到后续日期（直到下次 rebalance）
+for i, rebalance_date in enumerate(quarter_dates):
+    today = rebalance_date
+    q = get_quarter(today)
+    # 选择 allowed funds（和主逻辑尽量一致）
+    allowed = []
+    for f in all_funds:
+        if fund_quarter.get(f) != q:
+            continue
+        cat = get_fund_category(f)
+        if cat == "股票型" or is_bond_fund(f):
+            allowed.append(f)
+        else:
+            allowed.append(f)   ###通通加入 只要日期对的上
+    allowed = sorted(list(set(allowed) | (set(ALWAYS_ALLOWED) & set(all_funds))))
+    if len(allowed) == 0:
+        continue
+
+    # 通过按季度缓存的方式获取 cov（特殊：2022Q1 使用 2022-01-25）
+    cov = get_cov_for_quarter(q, allowed)
+
+    # 如果 cov 为空或历史数据不足，退化为等权
+    if cov is None or cov.empty or cov.shape[0] <= 1:
+        w_equal = equal_weight_solver(allowed)
+        w_minvar = w_equal.copy()
+        w_maxshp = w_equal.copy()
+        w_maxdiv = w_equal.copy()
+    else:
+        # 需要用于 MaxSharpe 的历史日收益 hist（用与 cov 同样的日期范围）
+        # 这里从 cov_cache key 恢复 hist 的日期范围：使用同样的 cov_date 与 lookback 来取 hist
+        # 简单而稳妥的方式：重建 hist 与 cov 的列一致性
+        # 找到 cov_date（最接近的日）:
+        # cov_date 寻找方法同 get_cov_for_quarter 内部逻辑 —— 最后一个 <= 对应季度第一天
+        # 直接复用 get_cov_for_quarter 的实现细节：我们可以重-get window
+        if q == "2022Q1":
+            cov_date = pd.Timestamp("2022-01-25")
+        else:
+            matching = [d for d in quarter_dates if get_quarter(d) == q]
+            cov_date = matching[0] if len(matching) > 0 else \
+            valid_dates[valid_dates.map(lambda d: get_quarter(d) == q)][0]
+        cov_idx = _find_nearest_index_on_or_before(daily_ret.index, cov_date)
+        start_idx = max(0, cov_idx - lookback)
+        hist = daily_ret.iloc[start_idx:cov_idx + 1][list(cov.columns)].dropna(how="all")
+        hist = hist.loc[:, ~hist.columns.duplicated()]
+
+        # 计算策略权重
+        w_equal_part = equal_weight_solver(list(cov.columns))
+        w_minvar_part = min_variance_solver(cov)
+        w_maxshp_part = max_sharpe_solver(hist, cov)
+        w_maxdiv_part = max_diversification_solver(hist, cov)
+
+
+        def expand(w_part, allowed):
+            w = pd.Series(0.0, index=allowed)
+            for f in w_part.index:
+                if f in w.index:
+                    w[f] = w_part[f]
+            if w.sum() == 0:
+                return pd.Series(np.ones(len(allowed)) / len(allowed), index=allowed)
+            return w / w.sum()
+
+
+        w_equal = expand(w_equal_part, allowed)
+        w_minvar = expand(w_minvar_part, allowed)
+        w_maxshp = expand(w_maxshp_part, allowed)
+        w_maxdiv = expand(w_maxdiv_part, allowed)
+
+    # # 历史窗口
+    # idx_in_all = all_dates.get_loc(today)
+    # start = max(0, idx_in_all - lookback)
+    # hist = daily_ret.iloc[start:idx_in_all][allowed].dropna(how="all")
+    # hist = hist.loc[:, ~hist.columns.duplicated()]
+    #
+    # # 如果历史数据不足，退化为等权
+    # if hist.shape[0] < 5:
+    #     w_equal = equal_weight_solver(allowed)
+    #     w_minvar = w_equal.copy()
+    #     w_maxshp = w_equal.copy()
+    #     w_maxdiv = w_equal.copy()
+    # else:
+    #     cov = hist.cov()
+    #     cov = cov.loc[~cov.index.duplicated(), ~cov.columns.duplicated()]
+    #     valid_cols = cov.columns[cov.notna().all()]
+    #     cov = cov.loc[valid_cols, valid_cols]
+    #     # 如果cov为空或只有一个资产，退化处理
+    #     if len(cov) == 0 or cov.shape[0] == 1:
+    #         w_equal = equal_weight_solver(allowed)
+    #         w_minvar = w_equal.copy()
+    #         w_maxshp = w_equal.copy()
+    #         w_maxdiv = w_equal.copy()
+    #     else:
+    #         # 计算各策略在 allowed 上的部分权重
+    #         # 注意：solvers 接受 cov 的子集列，返回索引为资金代码
+    #         w_equal_part = equal_weight_solver(list(cov.columns))
+    #         w_minvar_part = min_variance_solver(cov)
+    #         w_maxshp_part = max_sharpe_solver(hist, cov)
+    #         w_maxdiv_part = max_diversification_solver(hist, cov)
+    #
+    #         # 将部分权重映射回全部 allowed（那些不在 cov.columns 的置为0）
+    #         def expand(w_part, allowed):
+    #             w = pd.Series(0.0, index=allowed)
+    #             for f in w_part.index:
+    #                 if f in w.index:
+    #                     w[f] = w_part[f]
+    #             if w.sum() == 0:
+    #                 print("错误1")
+    #             return w / w.sum()
+    #
+    #         w_equal = expand(w_equal_part, allowed)
+    #         w_minvar = expand(w_minvar_part, allowed)
+    #         w_maxshp = expand(w_maxshp_part, allowed)
+    #         w_maxdiv = expand(w_maxdiv_part, allowed)
+
+    # 把权重写入对应策略的 results.weights（在 rebalance 当天）
+    for sname, w in [("EqualWeight", w_equal), ("MinVariance", w_minvar),
+                     ("MaxSharpe", w_maxshp), ("MaxDiversification", w_maxdiv)]:
+        strat_results[sname]['weights'].loc[today] = w.reindex(all_funds, fill_value=0)
+
+    # 调仓时处理手续费与首次持仓（尽量模仿主逻辑）
+    for sname in strategy_names:
+        # 上一次调仓日前一天的 NAV 和持仓
+        prev_candidates = valid_dates[valid_dates < today]
+        if len(prev_candidates) == 0:
+            prev_nav = 100.0
+            prev_holding = pd.Series(0.0, index=all_funds)
+        else:
+            prev_day = prev_candidates[-1]
+            prev_nav = strat_results[sname]['nav'].loc[prev_day]
+            prev_holding = strat_results[sname]['holdings'].loc[prev_day].fillna(0)
+
+        target_w = strat_results[sname]['weights'].loc[today]
+        target_value = target_w.reindex(all_funds, fill_value=0) * prev_nav
+        fee = (target_value - prev_holding).abs().sum() * FEE_RATE
+        nav_after_fee = prev_nav - fee
+
+        # 写入当日 NAV 与 holdings（按 target_value，但使用扣费后的 NAV 作为组合规模）
+        # 为了与主逻辑一致，我们缩放 target_value 使得总和等于 nav_after_fee（避免现金/剩余）
+        if target_value.sum() > 0:
+            scaling = nav_after_fee / target_value.sum()
+        else:
+            scaling = 0.0
+        target_value_scaled = target_value * scaling
+
+        strat_results[sname]['nav'].loc[today] = nav_after_fee
+        strat_results[sname]['holdings'].loc[today] = target_value_scaled
+
+        # 当日基于当日收益更新持仓
+        if today in daily_ret.index:
+            ret_today = daily_ret.loc[today].reindex(all_funds, fill_value=0)
+        else:
+            ret_today = pd.Series(0.0, index=all_funds)
+        holdings_today = strat_results[sname]['holdings'].loc[today] * (1 + ret_today)
+        strat_results[sname]['holdings'].loc[today] = holdings_today
+        total_val = holdings_today.sum()
+        strat_results[sname]['nav'].loc[today] = total_val
+        if total_val > 0:
+            strat_results[sname]['real_weights'].loc[today] = holdings_today / total_val
+        else:
+            strat_results[sname]['real_weights'].loc[today] = 0.0
+
+    # 对应到整季度内每日滚动（从 today+1 到 next_rebalance-1）
+    next_rebalance = quarter_dates[i + 1] if i + 1 < len(quarter_dates) else valid_dates[-1] + pd.Timedelta(days=1)
+    mask_dates = valid_dates[(valid_dates > today) & (valid_dates < next_rebalance)]
+    prev_holdings_by_strategy = {s: strat_results[s]['holdings'].loc[today].copy() for s in strategy_names}
+
+    for date_idx in mask_dates:
+        # 当日收益向后滚动
+        if date_idx in daily_ret.index:
+            ret_today = daily_ret.loc[date_idx].reindex(all_funds, fill_value=0)
+        else:
+            ret_today = pd.Series(0.0, index=all_funds)
+        for s in strategy_names:
+            prev_holding = prev_holdings_by_strategy[s]
+            holdings_today = prev_holding * (1 + ret_today)
+            strat_results[s]['holdings'].loc[date_idx] = holdings_today
+            total_value = holdings_today.sum()
+            strat_results[s]['nav'].loc[date_idx] = total_value
+            if total_value > 0:
+                strat_results[s]['real_weights'].loc[date_idx] = holdings_today / total_value
+            else:
+                strat_results[s]['real_weights'].loc[date_idx] = 0.0
+            # weights sheet 保持为 rebalance 当天的目标权重（与你主逻辑一致）
+            strat_results[s]['weights'].loc[date_idx] = strat_results[s]['weights'].loc[today]
+            prev_holdings_by_strategy[s] = holdings_today
+
+# ===================== 输出 =====================
+output_file = "risk_budget_output_fixed.xlsx"
+with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    for cluster in clusters:
+        results[cluster]['nav'].to_frame(f"NAV_Cluster{cluster}").to_excel(writer, sheet_name=f"净值_类{cluster}")
+        results[cluster]['weights'].to_excel(writer, sheet_name=f"季度权重_类{cluster}")
+        real_weights[cluster].to_excel(writer, sheet_name=f"真实每日权重_类{cluster}")
+        holdings[cluster].to_excel(writer, sheet_name=f"每日持仓金额_类{cluster}")
+    pd.DataFrame.from_dict(RISK_BUDGET, orient='index', columns=['风险预算']).to_excel(writer, sheet_name="风险预算配置")
+with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+    for s in strategy_names:
+        strat_results[s]['nav'].to_frame(f"NAV_{s}").to_excel(writer, sheet_name=f"NAV_{s}")
+        strat_results[s]['weights'].to_excel(writer, sheet_name=f"Weights_{s}")
+        strat_results[s]['holdings'].to_excel(writer, sheet_name=f"Holdings_{s}")
+        strat_results[s]['real_weights'].to_excel(writer, sheet_name=f"RealWeights_{s}")
+
+print("新增策略（等权/最小方差/最大夏普/最大分散化）结果已追加并保存到同一文件:", output_file)
+
+
+def calculate_benchmark_nav(daily_ret, fund_quarter, fund_type, start_date="2022-01-01", start_nav=100.0):
+    """
+    计算股2债8基准净值
+    每季度使用该季度可用的股票型和债券型基金计算平均收益
+    """
+
+    # 筛选指定日期之后的收益率数据
+    valid_dates = daily_ret.index[daily_ret.index >= pd.Timestamp(start_date)]
+    daily_ret_filtered = daily_ret.loc[valid_dates]
+
+    # 获取季度调仓日期（与主代码一致）
+    def get_quarter(dt):
+        m = dt.month
+        return f"{dt.year}Q{(m - 1) // 3 + 1}"
+
+    quarter_dates = []
+    current_quarter = None
+    for today in valid_dates:
+        q = get_quarter(today)
+        if q != current_quarter:
+            quarter_dates.append(today)
+            current_quarter = q
+
+    print(f"季度调仓日期: {[d.strftime('%Y-%m-%d') for d in quarter_dates]}")
+
+    # 计算基准净值
+    benchmark_nav = pd.Series(0.0, index=valid_dates)
+    benchmark_nav.iloc[0] = start_nav
+
+    # 逐日计算基准收益
+    for i in range(1, len(valid_dates)):
+        today = valid_dates[i]
+        current_q = get_quarter(today)
+
+        # 筛选当前季度可用的股票型和债券型基金
+        stock_funds_current_q = []
+        bond_funds_current_q = []
+
+        for fund in daily_ret_filtered.columns:
+            # 检查基金是否在当前季度可用
+            if fund_quarter.get(fund) == current_q:
+                category = get_fund_category(fund)
+                if category == "股票型":
+                    stock_funds_current_q.append(fund)
+                elif category == "债券型":
+                    bond_funds_current_q.append(fund)
+
+        # 计算当日股票和债券平均收益
+        if stock_funds_current_q and bond_funds_current_q:
+            stock_ret_today = daily_ret_filtered.loc[today, stock_funds_current_q].mean()
+            bond_ret_today = daily_ret_filtered.loc[today, bond_funds_current_q].mean()
+
+            # 处理NaN值
+            stock_ret_today = 0 if pd.isna(stock_ret_today) else stock_ret_today
+            bond_ret_today = 0 if pd.isna(bond_ret_today) else bond_ret_today
+
+            # 计算基准当日收益 (股2债8)
+            benchmark_ret_today = stock_ret_today * 0.2 + bond_ret_today * 0.8
+
+        else:
+            # 如果没有可用的基金，收益为0
+            benchmark_ret_today = 0
+            if i == 1:  # 只在第一天打印警告
+                print(f"警告: {today.date()} 季度 {current_q} 缺少股票型或债券型基金")
+
+        # 更新净值
+        benchmark_nav.iloc[i] = benchmark_nav.iloc[i - 1] * (1 + benchmark_ret_today)
+
+    return benchmark_nav
+
+
+# 使用您的数据计算基准净值
+benchmark_nav = calculate_benchmark_nav(daily_ret, fund_quarter, fund_type, start_date="2022-01-01")
+
+# 输出基准净值结果
+print("\n基准净值统计:")
+print(f"时间范围: {benchmark_nav.index[0].strftime('%Y-%m-%d')} 至 {benchmark_nav.index[-1].strftime('%Y-%m-%d')}")
+print(f"起始净值: {benchmark_nav.iloc[0]:.2f}")
+print(f"最终净值: {benchmark_nav.iloc[-1]:.2f}")
+print(f"总收益率: {(benchmark_nav.iloc[-1] / benchmark_nav.iloc[0] - 1) * 100:.2f}%")
+
+# 将基准净值保存到Excel文件
+output_file = "risk_budget_output_fixed.xlsx"
+
+# 检查文件是否存在，选择不同的模式
+if os.path.exists(output_file):
+    with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+        benchmark_nav.to_frame("基准净值_股2债8").to_excel(writer, sheet_name="基准净值")
+else:
+    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+        benchmark_nav.to_frame("基准净值_股2债8").to_excel(writer, sheet_name="基准净值")
+
+print(f"基准净值已保存到 {output_file}")
+
+# 与策略净值比较
+print("\n策略与基准比较:")
+for cluster in clusters:
+    strategy_nav = results[cluster]['nav']
+    # 确保日期对齐
+    common_dates = strategy_nav.index.intersection(benchmark_nav.index)
+    if len(common_dates) > 0:
+        strategy_common = strategy_nav.loc[common_dates]
+        benchmark_common = benchmark_nav.loc[common_dates]
+
+        strategy_total_return = (strategy_common.iloc[-1] / strategy_common.iloc[0] - 1) * 100
+        benchmark_total_return = (benchmark_common.iloc[-1] / benchmark_common.iloc[0] - 1) * 100
+        excess_return = strategy_total_return - benchmark_total_return
+
+        print(f"Cluster {cluster}:")
+        print(f"  策略总收益: {strategy_total_return:.2f}%")
+        print(f"  基准总收益: {benchmark_total_return:.2f}%")
+        print(f"  超额收益: {excess_return:.2f}%")
+
+# ===================== 新增：5类资产滚动波动率和相关性分析 =====================
+
+# 1. 计算每类资产的日收益率序列
+asset_categories = ["股票型", "债券型", "混合型", "商品型", "QDII"]
+category_returns = {}
+
+for category in asset_categories:
+    # 获取该类别的所有基金
+    category_funds = [f for f in daily_ret.columns if get_fund_category(f) == category]
+
+    if category_funds:
+        # 计算该类别的等权平均日收益率
+        category_daily_ret = daily_ret[category_funds].mean(axis=1)
+        category_returns[category] = category_daily_ret
+    else:
+        print(f"警告: 未找到 {category} 类别的基金")
+        category_returns[category] = pd.Series(0, index=daily_ret.index)
+
+# 转换为DataFrame便于处理
+category_returns_df = pd.DataFrame(category_returns)
+
+# 2. 计算滚动波动率（21天，约1个月）
+rolling_volatility = category_returns_df.rolling(window=21).std() * np.sqrt(252) * 100  # 年化百分比
+
+# ------------------ 新增：绘图（策略 vs 基准） ------------------
+
+
+# 要绘制的系列（键 -> (series, label)）
+plot_series = {}
+
+# 主策略（cluster '0'）
+try:
+    main_nav = results['0']['nav']
+    plot_series['主策略'] = main_nav
+except Exception:
+    pass
+
+# 基准
+try:
+    plot_series['基准 (股2债8)'] = benchmark_nav
+except Exception:
+    pass
+
+# 新增策略
+for s in ["EqualWeight", "MinVariance", "MaxSharpe", "MaxDiversification"]:
+    try:
+        nav = strat_results[s]['nav']
+        plot_series[f"策略-{s}"] = nav
+    except Exception:
+        continue
+
+# 保证至少有两条可画线
+if len(plot_series) < 1:
+    print("绘图：没有找到可用的 NAV 数据，跳过绘图。")
+else:
+    # 对所有 series 做日期交集对齐（取并集并对齐到每个 series 的索引）
+    # 为了可视化一致性，我们先构造一个排序后的日期索引（并集）
+    all_dates_union = None
+    for sname, ser in plot_series.items():
+        if all_dates_union is None:
+            all_dates_union = ser.index
+        else:
+            all_dates_union = all_dates_union.union(ser.index)
+    all_dates_union = all_dates_union.sort_values()
+
+    # 将每个 series 重建为以 all_dates_union 为索引，缺失用 NaN（绘图时 matplotlib 会断线）
+    plot_prepared = {}
+    for sname, ser in plot_series.items():
+        ser_reindexed = ser.reindex(all_dates_union)
+        plot_prepared[sname] = ser_reindexed
+
+    # 绘图
+    plt.figure(figsize=(12, 6))
+    for sname, ser in plot_prepared.items():
+        plt.plot(ser.index, ser.values, label=sname, linewidth=1.5)
+
+    plt.title('策略净值对比', fontsize=14)
+    plt.xlabel('日期')
+    plt.ylabel('净值')
+    plt.legend(loc='best')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    # 保存并显示
+    figfile = "strategy_vs_benchmark.png"
+    plt.savefig(figfile, dpi=300, bbox_inches='tight')
+    try:
+        plt.show()
+    except Exception:
+        # 在无图形界面时也不报错
+        pass
+    print(f"已保存图像到：{figfile}")
+
+# ------------------ 绘图代码结束 ------------------
+
+# 要绘制的大类顺序和内部使用的标签
+asset_categories = ["债券型", "股票型", "混合型", "商品型", "QDII"]
+# 策略序列：主策略（如果存在）+ 新增四策略
+plot_strategies = []
+# 尝试加入主策略（cluster '0' 的 real_weights）
+try:
+    if '0' in results and 'real_weights' in results['0']:
+        plot_strategies.append(('主策略', results['0']['real_weights']))
+except Exception:
+    pass
+def safe_filename(s):
+    try:
+        # 只允许字母、数字、下划线、横杠；其它全部替换成 "_"
+        return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(s))
+    except Exception:
+        return "strategy"
+# 新增四个策略
+for s in ["EqualWeight", "MinVariance", "MaxSharpe", "MaxDiversification"]:
+    try:
+        if s in strat_results and 'real_weights' in strat_results[s]:
+            plot_strategies.append((f"策略-{s}", strat_results[s]['real_weights']))
+    except Exception:
+        pass
+
+# ---------- 以下代码替换原来从 if len(plot_strategies) == 0: 开始的绘图与写表格部分 ----------
+if len(plot_strategies) == 0:
+    print("未发现任何策略的 real_weights 数据，跳过大类权重绘图。")
+else:
+    # 确保 asset_categories 已定义
+    asset_categories = ["债券型", "股票型", "混合型", "商品型", "QDII"]
+
+    # 辅助函数：计算某策略在某大类上的时间序列权重（按实际权重 real_weights）
+    def aggregate_category_weight(real_weights_df, category_name):
+        """
+        real_weights_df: DataFrame(index=dates, columns=fund_codes)
+        category_name: one of asset_categories
+        返回：Series(index=dates) 每日该大类的权重（0~1）
+        """
+        cols = [c for c in real_weights_df.columns]
+        if len(cols) == 0:
+            return pd.Series(dtype=float)
+        mask_cols = [get_fund_category(c) == category_name for c in cols]
+        # 如果没有该类别基金，返回全 0 序列（与索引对齐）
+        if not any(mask_cols):
+            return pd.Series(0.0, index=real_weights_df.index)
+        sel_idx = np.where(mask_cols)[0]
+        if len(sel_idx) == 0:
+            return pd.Series(0.0, index=real_weights_df.index)
+        selected = real_weights_df.iloc[:, sel_idx]
+        return selected.fillna(0.0).sum(axis=1)
+
+    # 先构造并集日期索引（用于对齐所有策略）
+    all_plot_dates = None
+    for name, rw in plot_strategies:
+        if all_plot_dates is None:
+            all_plot_dates = rw.index
+        else:
+            all_plot_dates = all_plot_dates.union(rw.index)
+    all_plot_dates = all_plot_dates.sort_values()
+
+    excel_plot_tables = {}  # sheet_name -> DataFrame
+
+    # 对每个策略绘图（每个策略一张堆叠面积图 + 一张末期柱状图），并保存对应表格
+    for name, rw in plot_strategies:
+        try:
+            # 计算该策略每个大类的时间序列，并放入 DataFrame（index = all_plot_dates）
+            cat_series_dict = {}
+            for category in asset_categories:
+                s = aggregate_category_weight(rw, category)
+                s = s.reindex(all_plot_dates)  # 对齐到并集日期
+                # NaN 表示该日策略没有该类数据，按 0 处理以便堆叠
+                s = s.fillna(0.0)
+                cat_series_dict[category] = s
+
+            df_strategy = pd.DataFrame(cat_series_dict, index=all_plot_dates)
+            df_strategy.index.name = '日期'
+
+            # 如果全为空或全 0，则跳过绘图但写入一个空表
+            if df_strategy.sum(axis=1).sum() == 0:
+                print(f"策略 {name} 的所有类别权重全为 0，跳过绘图，但会写入空表。")
+                excel_plot_tables[f"策略_{name}_权重分布"] = df_strategy
+                continue
+
+            # ---------- 堆叠面积图（时间序列） ----------
+            plt.figure(figsize=(12, 6))
+            # stackplot 需要 x 和多列 values
+            x = df_strategy.index
+            y_values = [df_strategy[col].values for col in asset_categories]
+            plt.stackplot(x, *y_values, labels=asset_categories)  # 不指定颜色，让 matplotlib 默认
+            plt.legend(loc='upper left')
+            plt.title(f"{name} — 各资产类别权重堆叠面积图", fontsize=14)
+            plt.xlabel("日期")
+            plt.ylabel("权重占比（组合中）")
+            plt.grid(True, alpha=0.25)
+            plt.tight_layout()
+            fname_area = f"strategy_{safe_filename(name)}_stacked_area.png"
+            plt.savefig(fname_area, dpi=300, bbox_inches='tight')
+            try:
+                plt.show()
+            except Exception:
+                pass
+            plt.close()
+            print(f"已保存堆叠面积图: {fname_area}")
+
+            # ---------- 末期（最后一个可用日期）柱状图 ----------
+            last_valid_idx = None
+            # 选最后一个不是全 0 的日期作为末期展示（防止最后几天全 0）
+            for idx in reversed(df_strategy.index):
+                if df_strategy.loc[idx].sum() > 0:
+                    last_valid_idx = idx
+                    break
+            if last_valid_idx is None:
+                last_valid_idx = df_strategy.index[-1]
+
+            last_vals = df_strategy.loc[last_valid_idx]
+            plt.figure(figsize=(8, 4.5))
+            last_vals.plot(kind='bar', rot=0)
+            plt.title(f"{name} — 各类权重（末期 {pd.to_datetime(last_valid_idx).date()}）", fontsize=13)
+            plt.ylabel("权重")
+            plt.xlabel("")
+            plt.tight_layout()
+            fname_bar = f"strategy_{safe_filename(name)}_last_bar.png"
+            plt.savefig(fname_bar, dpi=300, bbox_inches='tight')
+            try:
+                plt.show()
+            except Exception:
+                pass
+            plt.close()
+            print(f"已保存末期柱状图: {fname_bar}")
+
+            # 保存到待写入的字典（每个策略一个 sheet）
+            excel_plot_tables[f"策略_{name}_权重分布"] = df_strategy
+
+        except Exception as e:
+            print(f"绘制/处理策略 {name} 出错，跳过该策略：{e}")
+            continue
+
+    # 将所有策略的权重时间序列写入 output_file（每个策略一个 sheet）
+    try:
+        if os.path.exists(output_file):
+            # 用 append 模式并替换同名 sheet
+            with pd.ExcelWriter(output_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                for sheet_name, df in excel_plot_tables.items():
+                    if df is None or df.shape[0] == 0:
+                        # 仍写入空表以示存在（可根据需要改成跳过）
+                        df.to_excel(writer, sheet_name=sheet_name)
+                    else:
+                        df.to_excel(writer, sheet_name=sheet_name)
+        else:
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                for sheet_name, df in excel_plot_tables.items():
+                    if df is None or df.shape[0] == 0:
+                        df.to_excel(writer, sheet_name=sheet_name)
+                    else:
+                        df.to_excel(writer, sheet_name=sheet_name)
+        print(f"每个策略的各资产类别权重已写入 Excel（每策略一个 sheet）：{output_file}")
+    except Exception as e:
+        print("写入每策略权重数据到 Excel 失败：", e)
+
+
+# ---------- 辅助小函数：把策略名转换为文件系统安全的文件名 ----------
+def safe_filename(s):
+    try:
+        # 简单替换空格和特殊字符
+        return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in str(s))
+    except Exception:
+        return "strategy"
